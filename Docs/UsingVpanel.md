@@ -2,8 +2,9 @@
 
 This document describes vpanel_pdp1, the on-screen PDP-1 front panel, and how to use it.
 
-This is version 1.0\
-Edit date 11-Nov-2026
+This is version 1.1\
+Edit date 13-Nov-2026\
+the front panel in the browser added
 
 ## What is it?
 
@@ -45,6 +46,30 @@ sees the hardware's settings.
 That matters for POWER: the emulator power clears, resetting the machine, if it sees POWER off even briefly.
 
 The *-m* and *-a* switches, below, override this.
+
+## The front panel in the browser
+
+The web interface, the *web* choice in pdp1control.sh or pdp1central, also shows the front panel:
+the *Front Panel* section at the top of its page, at *http://<pi>:8080*.
+It is drawn from the same art and layout as vpanel_pdp1, by the browser, so it responds at once
+even when the Pi is a Pi Zero across the network, unlike vpanel_pdp1 over ssh X forwarding.
+
+- the lamps show their brightness, glowing up and fading like the original incandescent bulbs
+- the mouse works the switches and keys as in vpanel_pdp1, below
+- *Rack Panel* shows or hides the rack top (I/O) panel; *800px*, *1200px* and *Full Width* set the size;
+  the browser remembers both
+- while the hardware panel's driver runs, it mirrors the hardware panel, as vpanel_pdp1 does,
+  and says *mirroring hardware panel*
+- with the emulator not started, it says *emulator not running*
+
+Like vpanel_pdp1, it never overwrites a switch setting another program has changed:
+the page sends the settings it was showing along with the ones it wants, and only the switches
+that differ are changed.
+
+The web server, web_pdp1/panel.go, reads the panel the same way vpanel_pdp1 does, so it can run alongside
+vpanel_pdp1 and the hardware panel. Only one browser can be connected at a time, as for the rest of the web interface.
+
+The art and layout in web_pdp1/srv/panel are made by the same script as vpanel_pdp1's, see *The art*.
 
 ## Using the panel
 
@@ -98,3 +123,6 @@ The panel art is built into the program, it needs no files at run time.
 It is all made at twice the size it is drawn at scale 1, so it stays sharp up to scale 2.
 It is made by *src/vpanel_pdp1/art/mkvpanelart.py*, from the original console art,
 *pdp1_panel.png*, see that file if the art is to be changed.
+The script also writes the browser front panel's copy of the art and its *layout.json*, every lamp,
+switch and key's place taken from vpanel_pdp1's own element table, so the two always match.
+Run it again after changing the art or the layout, and commit what it writes in both places.

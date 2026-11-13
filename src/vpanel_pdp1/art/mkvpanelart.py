@@ -26,6 +26,10 @@ the window is scaled up, vpanel_pdp1 draws each piece into a rectangle of half i
 
 and then remakes panelart.inc, pdp1art.inc and ioart.inc from the pngs with xxd -i.
 
+It also writes the web server's front panel, web_pdp1/srv/panel/: a copy of the pngs and layout.json,
+every lamp, switch and key's place and bit, worked out from ../elements.inc and the grid in ../main.c's
+init() exactly as vpanel_pdp1 places them, so the two front ends always agree.
+
 This only needs to be run if the art changes, the generated pngs and .inc files are committed.
 It needs python3 with PIL, xxd, and the Nimbus Sans Narrow Bold font.
 
@@ -36,8 +40,12 @@ ART_SCALE MUST match ART_SCALE in ../main.c.
 6-Nov-2026 Claude: initial version
 6-Nov-2026 Claude: everything at 2x, redraw the lamps and keys, redraw the console labels
 6-Nov-2026 Claude: lit lamps look like glowing bulbs
+13-Nov-2026 Claude: also write the web server's front panel art and layout.json
 """
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from PIL import Image, ImageDraw, ImageFont
@@ -370,6 +378,105 @@ def io_panel():
     return im
 
 
+# ---- web front panel
+
+WEB_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "..", "web_pdp1", "srv", "panel"))
+ELEMENTS = os.path.join(HERE, "..", "elements.inc")
+WEB_ART = ["pdp1_panel_2x", "io_panel", "lamp_on", "lamp_off", "switch_u", "switch_d", "switch_l", "switch_r",
+           "key_n", "key_d", "key_u"]
+
+# The console grids, as ../main.c's init() sets them, logical pixels, the console's own top at 0.
+SCL = 800.0 / 500.0
+GRID1 = dict(xscl=12.95 * SCL, yscl=12.9 * SCL, xoff=4.5 * SCL + 12.95 * SCL / 2, yoff=2.56 * SCL)
+GRID2 = dict(GRID1, xoff=1.05 * SCL + 12.95 * SCL / 2)
+GRID3 = dict(xscl=IO_XSCL, yscl=IO_YSCL, xoff=IO_X0, yoff=IO_Y0)
+
+# Logical sprite sizes, the art's size over ART_SCALE.
+SIZES = {"lamptex": (16, 18), "switchtex": (16, 18), "hswitchtex": (18, 16), "keytex": (27, 27)}
+
+# ../main.c's init() carves lights[] and switches[] into groups by count, and updatepanel() gives each group
+# a Panel word and the bit of its first element, each next element one bit lower.
+# These MUST match main.c; the counts are checked against elements.inc below.
+LAMP_GROUPS = [  # count, lights row, first bit
+    (16, 0, 0o100000), (16, 1, 0o100000), (18, 2, 0o400000), (18, 3, 0o400000), (18, 4, 0o400000),
+    (13, 5, 0o400000), (3, 5, 0o000004), (6, 6, 0o004000), (6, 6, 0o000040), (5, 6, 0o400000)]
+SWITCH_GROUPS = [  # count, sw word, first bit, or a list of (word, bit) one per element
+    (1, [(0, 0o400000)]),                                   # EXTEND
+    (16, 0, 0o100000),                                      # TA
+    (18, 1, 0o400000),                                      # TW
+    (3, [(0, 0o200000), (2, 0o400000), (2, 0o200000)]),     # POWER, SINGLE STEP, SINGLE INST
+    (6, 2, 0o100000)]                                       # sense switches
+# Keys, in elements.inc order: the sw2 bit for pressed down and for lifted up, 0 for none.
+KEY_BITS = [(0o001000, 0o000400), (0o000200, 0), (0o000100, 0), (0o000040, 0), (0, 0o000020),
+            (0o000010, 0), (0o000004, 0o000002), (0o000001, 0)]
+
+
+def parse_elements():
+    """Read lights[], switches[], keys[] and iolamps[] from elements.inc."""
+    arrays = {}
+    current, grid = None, None
+    for line in open(ELEMENTS):
+        m = re.match(r"\s*(Element|IoLamp)\s+(\w+)\[\]", line)
+        if m:
+            current = m.group(2)
+            arrays[current] = []
+            continue
+        m = re.match(r"#define G &(grid\d)", line)
+        if m:
+            grid = m.group(1)
+            continue
+        m = re.match(r"\s*\{\s*(\w+),\s*G,\s*([\d.]+),\s*([\d.]+),", line)
+        if m and current:
+            arrays[current].append((m.group(1), grid, float(m.group(2)), float(m.group(3))))
+            continue
+        m = re.match(r"\s*\{\s*([\d.]+),\s*([\d.]+),\s*(\d+),\s*(0[0-7]+)\s*\}", line)
+        if m and current == "iolamps":
+            arrays[current].append((float(m.group(1)), float(m.group(2)), int(m.group(3)), int(m.group(4), 8)))
+    return arrays
+
+
+def place(tex, grid, x, y):
+    """The element's rectangle, as putongrid() in ../main.c makes it: C float to int truncation, int w/2."""
+    g = {"grid1": GRID1, "grid2": GRID2, "grid3": GRID3}[grid]
+    w, h = SIZES[tex]
+    return [int(g["xoff"] - w // 2 + g["xscl"] * x), int(g["yoff"] - h // 2 + g["yscl"] * y), w, h]
+
+
+def expand(groups, total):
+    """One (word, bit) per element from a group table."""
+    out = []
+    for grp in groups:
+        if isinstance(grp[1], list):
+            out += grp[1]
+        else:
+            n, word, bit = grp
+            out += [(word, bit >> i) for i in range(n)]
+    assert len(out) == total, "group table has %d elements, elements.inc %d" % (len(out), total)
+    return out
+
+
+def web_layout():
+    a = parse_elements()
+    lamps = [dict(r=place(t, g, x, y), row=w, mask=b)
+             for (t, g, x, y), (w, b) in zip(a["lights"], expand(LAMP_GROUPS, len(a["lights"])))]
+    switches = [dict(r=place(t, g, x, y), word=w, mask=b, horiz=(t == "hswitchtex"))
+                for (t, g, x, y), (w, b) in zip(a["switches"], expand(SWITCH_GROUPS, len(a["switches"])))]
+    assert len(a["keys"]) == len(KEY_BITS)
+    keys = [dict(r=place(t, g, x, y), down=d, up=u) for (t, g, x, y), (d, u) in zip(a["keys"], KEY_BITS)]
+    iolamps = [dict(r=place("lamptex", "grid3", x, y), row=row, mask=mask) for x, y, row, mask in a["iolamps"]]
+    return dict(consoleW=IO_W, consoleH=448, ioH=IO_H, artScale=ART_SCALE,
+                lamps=lamps, switches=switches, keys=keys, iolamps=iolamps)
+
+
+def web_panel():
+    os.makedirs(WEB_DIR, exist_ok=True)
+    for n in WEB_ART:
+        shutil.copyfile(os.path.join(HERE, n + ".png"), os.path.join(WEB_DIR, n + ".png"))
+    with open(os.path.join(WEB_DIR, "layout.json"), "w") as f:
+        json.dump(web_layout(), f, indent=1)
+        f.write("\n")
+
+
 def xxd(names, out):
     with open(os.path.join(HERE, out), "w") as f:
         for n in names:
@@ -396,6 +503,7 @@ def main():
         "panelart.inc")
     xxd(["pdp1_panel_2x"], "pdp1art.inc")
     xxd(["io_panel"], "ioart.inc")
+    web_panel()
     return 0
 
 
