@@ -17,6 +17,7 @@
 // newpanel and vpanel_pdp1.
 //
 // 13-Nov-2026 Claude: initial version
+// 14-Nov-2026 Claude: H.S. CYCLE stretched as in vpanel_pdp1
 
 package main
 
@@ -47,6 +48,10 @@ const (
 	keyBits       = 0001777 // KEY_START ... KEY_FEED in sw2, the momentary keys
 	panelInterval = 33 * time.Millisecond
 	hwCheckEvery  = time.Second
+
+	// H.S. CYCLE lights for only a few cycles at a time and would barely show, so as vpanel_pdp1 does,
+	// it is sent fully on when it lit at least this many cycles since the last read.
+	hscRow, hscCol, hscStretch = 5, 14, 30
 )
 
 // The hardware panel driver's process names, as vpanel_pdp1 looks for them.
@@ -158,6 +163,9 @@ func (p *Panel) readLamps() []byte {
 			on := uint64(cnt - p.lastCount[r][c])
 			p.lastCount[r][c] = cnt
 			if on > elapsed {
+				on = elapsed
+			}
+			if r == hscRow && c == hscCol && on >= hscStretch {
 				on = elapsed
 			}
 			lamps[r*panelCols+c] = byte(on * 255 / elapsed)

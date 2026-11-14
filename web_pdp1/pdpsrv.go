@@ -699,7 +699,13 @@ func main() {
 	go server.handlePanel()
 
 	http.HandleFunc("/ws", server.handleWebSocket)
-	http.Handle("/", http.FileServer(http.Dir("srv")))
+	// no-cache: the browser checks each file with the server before using its copy, so an edited
+	// page or script is used at the next load (304 Not Modified when unchanged).
+	files := http.FileServer(http.Dir("srv"))
+	http.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		files.ServeHTTP(w, r)
+	}))
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

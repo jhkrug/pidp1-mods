@@ -416,6 +416,7 @@
                 grid-template-areas:
                     "header"
                     "sidebar"
+                    "panel-content"
                     "main-content"
                     "tape-content"
                     "misc-content";
@@ -519,6 +520,14 @@
                         Audio Output
                     </label>
                 </div>
+
+                <div class="checkbox-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="panel-show" onchange="panelShow(this.checked);">
+                        <span class="checkmark"></span>
+                        Front Panel
+                    </label>
+                </div>
             </div>
 
             <div class="setting-group">
@@ -538,13 +547,14 @@
             </div>
         </div>
 
-        <div class="panel-content">
+        <div class="panel-content" style="display: none;">
             <!-- Front Panel, see panel.js -->
             <div class="panel">
                 <div class="panel-header">
                     Front Panel<span id="panel-status"></span>
                     <div class="header-controls">
                         <button class="button" id="panel-io">Rack Panel</button>
+                        <button class="button" id="panel-glow">Lamps: On/Off</button>
                         <button class="button" id="panel-800">800px</button>
                         <button class="button" id="panel-1200">1200px</button>
                         <button class="button" id="panel-full">Full Width</button>
@@ -1061,7 +1071,7 @@ typewriter = new Typewriter(document.getElementById('typewriter'),
 
 display = new p7sim(document.getElementById('display'));
 
-// The front panel; its size and whether the rack top panel shows are kept in localStorage.
+// The front panel; whether it shows, its size, the rack top panel and the lamp mode are kept in localStorage.
 let frontPanel = new FrontPanel(document.getElementById('frontPanel'), document.getElementById('panel-status'),
 		(m) => { if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m)); });
 frontPanel.load().catch((e) => print('front panel art failed to load', e));
@@ -1074,6 +1084,19 @@ document.getElementById('panel-800').onclick = () => panelWidth('800px');
 document.getElementById('panel-1200').onclick = () => panelWidth('1200px');
 document.getElementById('panel-full').onclick = () => panelWidth('100%');
 document.getElementById('panel-io').onclick = () => frontPanel.setShowIo(!frontPanel.showIo);
+function panelGlowLabel() {
+	document.getElementById('panel-glow').textContent = frontPanel.glow ? 'Lamps: Glow' : 'Lamps: On/Off';
+}
+panelGlowLabel();
+document.getElementById('panel-glow').onclick = () => { frontPanel.setGlow(!frontPanel.glow); panelGlowLabel(); };
+// The Front Panel tick box in Controls shows or hides the whole section; it starts hidden.
+function panelShow(on) {
+	document.querySelector('.panel-content').style.display = on ? '' : 'none';
+	document.getElementById('panel-show').checked = on;
+	frontPanel.setVisible(on);
+	localStorage.setItem('panelShow', on);
+}
+panelShow(localStorage.getItem('panelShow') === 'true');
 
 requestAnimationFrame(drawLoop);
 connectWS();

@@ -54,8 +54,10 @@ the *Front Panel* section at the top of its page, at *http://<pi>:8080*.
 It is drawn from the same art and layout as vpanel_pdp1, by the browser, so it responds at once
 even when the Pi is a Pi Zero across the network, unlike vpanel_pdp1 over ssh X forwarding.
 
-- the lamps show their brightness, glowing up and fading like the original incandescent bulbs
+- the lamps show on or off, as in vpanel_pdp1; *Lamps: On/Off* switches to *Lamps: Glow*, where they show
+  their brightness, glowing up and fading like the original incandescent bulbs, and back; the browser remembers it
 - the mouse works the switches and keys as in vpanel_pdp1, below
+- *Front Panel* in the *Controls* sidebar shows or hides the whole front panel, off at first, remembered by the browser
 - *Rack Panel* shows or hides the rack top (I/O) panel; *800px*, *1200px* and *Full Width* set the size;
   the browser remembers both
 - while the hardware panel's driver runs, it mirrors the hardware panel, as vpanel_pdp1 does,

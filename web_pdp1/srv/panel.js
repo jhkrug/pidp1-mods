@@ -9,7 +9,15 @@
 // on a key, left presses it down and right lifts it up, both while the button is held.
 // While the server says the hardware panel's driver runs, this only shows its switches.
 //
+// Lamps show on/off by default, as vpanel_pdp1 does: on when lit at least half the time, decided every
+// onOffMs, vpanel_pdp1's pace on a local display. Over ssh X forwarding, vpanel_pdp1's drawing slows it,
+// so there it changes more slowly than this.
+// Glow mode instead shows each lamp's brightness, eased like the incandescent bulbs.
+//
 // 13-Nov-2026 Claude: initial version
+// 14-Nov-2026 Claude: on/off lamps as vpanel_pdp1, glow as an option; nothing drawn while hidden
+
+const onOffMs = 33;
 
 class FrontPanel {
 	constructor(canvas, statusEl, sendFn) {
@@ -21,12 +29,17 @@ class FrontPanel {
 		this.layout = null;
 		this.img = {};
 		this.showIo = localStorage.getItem('panelShowIo') !== 'false';
+		this.glow = localStorage.getItem('panelGlow') === 'true';
+		this.visible = true;                   // false while hidden: nothing is drawn
 
 		this.present = false;
 		this.mirror = false;
 		this.sw = [0, 0, 0, 0];
 		this.target = new Uint8Array(180);     // brightness from the server, 10 rows of 18
 		this.shown = new Float32Array(180);    // brightness drawn, eased toward target
+		this.acc = new Float32Array(180);      // on/off: brightness times ms since the last decision
+		this.accMs = 0;
+		this.lastFrame = null;
 		this.heldKey = null;                   // { word, mask } of the key the mouse holds
 		this.dirty = true;
 
@@ -55,13 +68,26 @@ class FrontPanel {
 		for (const l of this.layout.iolamps) l.index = index(l);
 
 		this.resize();
-		requestAnimationFrame(() => this.frame());
+		requestAnimationFrame((t) => this.frame(t));
 	}
 
 	setShowIo(on) {
 		this.showIo = on;
 		localStorage.setItem('panelShowIo', on);
 		this.resize();
+	}
+
+	setVisible(on) {
+		this.visible = on;
+		this.dirty = true;
+	}
+
+	setGlow(on) {
+		this.glow = on;
+		this.acc.fill(0);
+		this.accMs = 0;
+		localStorage.setItem('panelGlow', on);
+		this.dirty = true;
 	}
 
 	// Canvas pixels are the art's, artScale times logical, so it's sharp at any displayed size.
@@ -85,9 +111,12 @@ class FrontPanel {
 		this.dirty = true;
 	}
 
-	frame() {
-		// Ease each lamp toward its brightness, fast on and slower off, like the incandescent bulbs.
-		for (let i = 0; i < 180; i++) {
+	frame(now) {
+		const dt = this.lastFrame === null ? 0 : Math.min(now - this.lastFrame, onOffMs);
+		this.lastFrame = now;
+		if (!this.glow) this.onOff(dt);
+		// Glow: ease each lamp toward its brightness, fast on and slower off, like the incandescent bulbs.
+		else for (let i = 0; i < 180; i++) {
 			const d = this.target[i] - this.shown[i];
 			if (Math.abs(d) > 0.5) {
 				this.shown[i] += d * (d > 0 ? 0.5 : 0.15);
@@ -97,11 +126,28 @@ class FrontPanel {
 				this.dirty = true;
 			}
 		}
-		if (this.dirty) {
+		if (this.dirty && this.visible && this.layout) {
 			this.draw();
 			this.dirty = false;
 		}
-		requestAnimationFrame(() => this.frame());
+		requestAnimationFrame((t) => this.frame(t));
+	}
+
+	// On/off: add up each lamp's brightness over time, each message's held until the next, and every
+	// onOffMs turn a lamp on when lit at least half the time, PWM_ON_THRESHOLD in vpanel_pdp1.
+	onOff(dt) {
+		for (let i = 0; i < 180; i++) this.acc[i] += this.target[i] * dt;
+		this.accMs += dt;
+		if (this.accMs < onOffMs) return;
+		for (let i = 0; i < 180; i++) {
+			const b = this.acc[i] / this.accMs >= 127 ? 255 : 0;  // half of 255, less the bytes rounding down
+			if (this.shown[i] !== b) {
+				this.shown[i] = b;
+				this.dirty = true;
+			}
+		}
+		this.acc.fill(0);
+		this.accMs = 0;
 	}
 
 	draw() {
