@@ -2,9 +2,9 @@
 
 This document describes vpanel_pdp1, the on-screen PDP-1 front panel, and how to use it.
 
-This is version 1.1\
-Edit date 15-Nov-2026\
-the front panel in the browser added
+This is version 1.2\
+Edit date 18-Nov-2026\
+running on another computer added
 
 ## What is it?
 
@@ -76,6 +76,60 @@ vpanel_pdp1 and the hardware panel. Only one browser can be connected at a time,
 
 The art and layout in web_pdp1/srv/panel are made by the same script as vpanel_pdp1's, see *The art*.
 
+## Running on another computer
+
+Vpanel_pdp1 can run on another computer, a laptop for example, and show the panel of the emulator on the Pi,
+as t30dpy does for the display.
+Give it the Pi's name or IPv4 address with -h:
+
+    vpanel_pdp1 -s 1.5 -h pidp1
+
+It connects to the emulator's panel port, 1046, which the emulator always opens, whichever interface is chosen.
+Over the network it responds at once, even to a Pi Zero, unlike vpanel_pdp1 over ssh X forwarding.
+
+- the lamps, switches and keys work as when it runs on the Pi
+- the window title shows the host, and *not connected* until the emulator answers;
+  vpanel_pdp1 tries again every 2 seconds, so it can be started before the emulator or left running across a restart
+- if the emulator stops answering for 3 seconds, the Pi is off or the network has gone for example,
+  it shows *not connected* and tries again
+- with no connection the lamps are dark and the switches and keys do nothing; once connected it shows
+  the switches where the emulator has them
+- while the hardware panel's driver runs on the Pi, it mirrors the hardware panel, as on the Pi
+- keys held down are let go if the connection is lost, within about 3 seconds when the laptop
+  goes to sleep or leaves the network without closing it
+
+The emulator changes only the switches that differ from what vpanel_pdp1 was showing,
+so as on the Pi, it never overwrites a switch setting another program has changed.
+Any number of panels can connect, they run alongside vpanel_pdp1 and the browser front panel on the Pi.
+
+The port has no password, like the emulator's other ports: anyone who can reach the Pi can work the switches.
+
+To build it on the other computer, it needs SDL2 and SDL2_image.
+Copy *src/vpanel_pdp1*, *src/common*, and *configuration.c* and *configuration.h* from *src/pdp1*,
+keeping their places under *src*, and run *make* in *src/vpanel_pdp1*.
+The program is *panel_pdp1*.
+
+### The panel port
+
+The panel port uses lines of text, so it can be tried with *nc pidp1 1046*.
+The emulator sends, at most about 30 times a second while something changes and at least once a second:
+
+    P <present> <mirror> <ack> <sw0> <sw1> <sw2> <sw3> <lamps>
+
+- present is 1 once the emulator has its panel
+- mirror is 1 while the hardware panel's driver runs
+- ack is the number of the last switch change it received
+- sw0 to sw3 are the switch words in octal, see src/common/panel_pidp1.h
+- lamps is 360 hex digits, the brightness 00 to ff of the 10 rows of 18 lamps, row 0 column 0 first;
+  it is rounded, so a lamp lit at least half the time, as vpanel_pdp1 shows on, is 80 and over
+
+A client changes switches and keys with:
+
+    S <seq> <want0> <want1> <want2> <base0> <base1> <base2>
+
+seq is a number that goes up with each change, base the switch words the client showed and want the ones it wants,
+in octal. Only the bits that differ between them are changed.
+
 ## Using the panel
 
 Mouse buttons work the switches and keys:
@@ -97,11 +151,13 @@ Each lamp is shown on or off, a lamp lit for at least half the time since the la
 
 ## Running from the command line
 
-**vpanel_pdp1** [-s scale] [-i] [-n]
+**vpanel_pdp1** [-s scale] [-i] [-n] [-h host[:port]]
 
 - s set the window size multiplier, 0.5 to 4.0, 1.5 for example
 - i show the rack top (I/O) panel
 - n don't show the rack top (I/O) panel
+- h show the panel of the emulator on host, through its panel port, 1046 if no port is given,
+  see *Running on another computer*; IPv4 only, as the emulator listens
 
 Command line switches override configuration file settings.
 

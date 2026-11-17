@@ -34,12 +34,24 @@
  *                    a change by another writer takes the keys too, so a key held in the browser stays held
  * 15-Nov-2026 Claude: each mouse button press looks for the hardware panel driver first,
  *                    thus a click never writes while the driver runs
+ * 17-Nov-2026 Claude: -h host, network mode: the panel of a pdp1 on another computer, through its
+ *                    panel port 1046 (pdp1/panelsrv.c); hwPanelRunning() moved to common.c
  * 18-Nov-2026 Claude: the mouse lets go only of a key it pressed, not one taken from another writer
+ * 18-Nov-2026 Claude: network mode: IPv4, as pdp1 listens; the name looked up before the window opens;
+ *                    no line for NETTIMEOUT_MS, or a connect that long, closes the connection;
+ *                    clicks do nothing while not connected; vpanelhost removed, -h only
  */
 #include <stdio.h>
 #include <unistd.h>
 #include <math.h>
-#include <dirent.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include "common.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
@@ -108,10 +120,6 @@ static int showIo = 1;
 // Set while the switches mirror the hardware panel's, see checkMode().
 static int mirroring = 0;
 
-// The hardware panel driver's process names: newpanel, run through the bin/panel_pidp1 link
-// as the scripts do or directly.
-static const char *hwPanelNames[] = { "panel_pidp1", "newpanel" };
-
 // How often, in ms, to look for the hardware panel driver.
 #define HWCHECK_MS  1000
 
@@ -123,6 +131,36 @@ static const char *hwPanelNames[] = { "panel_pidp1", "newpanel" };
 // Otherwise a stale POWER off written here could reach pdp1, which power clears on seeing it.
 static int lastSw[4];
 static int haveWritten = 0;
+
+// Network mode, -h host[:port]: the panel of a pdp1 on another computer, through its
+// panel port, see pdp1/panelsrv.c for the protocol.
+// panel then points at netPanel, which holds the switch words as pdp1 last sent them, so
+// mirrorSwitches() and the change checks in updatepanel() work as with the segment.
+// The lamps come as a brightness, netLamps, already made from the pwm counts by pdp1.
+// The hardware panel's driver runs on that computer, not here: pdp1 says whether it runs, netMirror.
+#define NETPORT         1046
+#define NETRETRY_MS     2000            // between two tries to connect
+#define NETTIMEOUT_MS   3000            // a connect, or the wait for a line, this long closes the connection
+#define NETRESOLVE_MS   30000           // a connect that fails looks the name up again at most this often
+#define NETLINEMAX      512
+static char *netHost = nil;             // nil: the segment, as always
+static int netPort = NETPORT;
+static int netFd = -1;
+static int netConnecting = 0;           // a connect() is in progress on netFd
+static int netHave = 0;                 // a P line came since the connection was made
+static Uint32 netLastTry = 0;
+static Uint32 netConnectStart = 0;      // when the connect in progress started
+static Uint32 netLastLine = 0;          // when the last P line came
+static struct sockaddr_in netAddr;      // netHost's address, IPv4 as pdp1 listens
+static int netResolved = 0;             // netAddr is set
+static Uint32 netResolveTime = 0;
+static Panel netPanel;
+static u8 netLamps[10 * 18];
+static int netPresent = 0;
+static int netMirror = 0;
+static unsigned long netSeq = 0;        // the last S line's number
+static char netIn[NETLINEMAX * 4];
+static size_t netInLen = 0;
 
 static SDL_Window *window;
 static SDL_Renderer *renderer;
@@ -238,8 +276,9 @@ Element iolights[nelem(iolamps)];
 int computeLightWord(Panel *panelP, int row, u64 expectedcycles);
 void loadConfig(void);
 void usage(void);
-int hwPanelRunning(void);
 void checkMode(void);
+void setTitle(void);
+void netPoll(void);
 void mirrorSwitches(int withKeys);
 
 // Decodes a baked-in PNG byte array (one of the pdp1art.inc/panelart.inc
@@ -550,7 +589,8 @@ unsigned i;
 Element *e;
 
     // Mirroring, the switches and keys show the hardware panel's, clicks do nothing.
-    if( mirroring )
+    // In network mode with no connection there is nowhere to send them, they do nothing either.
+    if( mirroring || (netHost && !netHave) )
     {
         return;
     }
@@ -639,6 +679,13 @@ int b, i;
 void
 initpanel(void)
 {
+    // Network mode: nothing to map, the switches are set from the first line pdp1 sends.
+    if( netHost )
+    {
+        panel = &netPanel;
+        return;
+    }
+
 	panel = createseg("/tmp/pdp1_panel", sizeof(Panel));
 	if(panel == nil)
 		exit(1);
@@ -653,60 +700,6 @@ initpanel(void)
     memcpy(lastcount, panel->pwmcount, sizeof(lastcount));
 }
 
-// Returns 1 if the hardware panel's driver is running, else 0.
-// Processes are matched by their exact name in /proc/<pid>/comm, as pdp1central's procCount() does,
-// a pattern could match something else.
-// A running driver shows that frontpanel=pidp is set. It does not show that a PiDP-1 board is
-// connected: the driver uses the GPIO controller of the Pi, which every Pi has.
-int
-hwPanelRunning(void)
-{
-DIR *dirP;
-struct dirent *entP;
-FILE *fP;
-char path[sizeof(entP->d_name) + 16];
-char comm[64];
-unsigned i;
-int found;
-
-    if( !(dirP = opendir("/proc")) )
-    {
-        return(0);
-    }
-
-    found = 0;
-    while( !found && (entP = readdir(dirP)) )
-    {
-        if( (entP->d_name[0] < '0') || (entP->d_name[0] > '9') )
-        {
-            continue;
-        }
-
-        snprintf(path, sizeof(path), "/proc/%s/comm", entP->d_name);
-        if( !(fP = fopen(path, "r")) )
-        {
-            continue;           // it ended while we looked
-        }
-
-        if( fgets(comm, sizeof(comm), fP) )
-        {
-            comm[strcspn(comm, "\n")] = '\0';
-            for(i = 0; i < nelem(hwPanelNames); i++)
-            {
-                if( !strcmp(comm, hwPanelNames[i]) )
-                {
-                    found = 1;
-                    break;
-                }
-            }
-        }
-        fclose(fP);
-    }
-
-    closedir(dirP);
-    return(found);
-}
-
 // Decide whether the switches mirror the hardware panel's or are worked here, see mirroring.
 // Called at startup and every HWCHECK_MS from the main loop.
 // Going from mirroring to active, the on-screen switches already show the last physical
@@ -717,7 +710,7 @@ checkMode(void)
 int want;
 unsigned i;
 
-    want = hwPanelRunning();
+    want = netHost ? netMirror : hwPanelRunning();
 
     if( want == mirroring )
     {
@@ -743,7 +736,313 @@ unsigned i;
         }
     }
 
-    SDL_SetWindowTitle(window, mirroring?"PDP-1 console (mirroring hardware panel)":"PDP-1 console");
+    setTitle();
+}
+
+// The window title shows the mode, and in network mode the host and whether it is connected.
+void
+setTitle(void)
+{
+char title[256];
+
+    if( netHost && !netHave )
+    {
+        snprintf(title, sizeof(title), "PDP-1 console (%s, not connected)", netHost);
+    }
+    else if( netHost )
+    {
+        snprintf(title, sizeof(title), "PDP-1 console (%s%s)", netHost,
+                 mirroring?", mirroring hardware panel":(netPresent?"":", no panel yet"));
+    }
+    else
+    {
+        snprintf(title, sizeof(title), "%s", mirroring?"PDP-1 console (mirroring hardware panel)":"PDP-1 console");
+    }
+    SDL_SetWindowTitle(window, title);
+}
+
+// Network mode: closes the connection, darkens the lamps and starts the wait for the next try.
+static void
+netClose(void)
+{
+unsigned i;
+
+    if( netFd >= 0 )
+    {
+        close(netFd);
+    }
+    netFd = -1;
+    netConnecting = 0;
+    netHave = 0;
+    netPresent = 0;
+    netMirror = 0;
+    netInLen = 0;
+    netLastTry = SDL_GetTicks();
+
+    // pdp1 lets go of the keys this held when it sees the connection close; the screen does too,
+    // so a key the mouse holds is not sent as pressed again after connecting.
+    for(i = 0; i < nelem(keys); i++)
+    {
+        keys[i].state = 0;
+        keys[i].active = 0;
+    }
+    for(i = 0; i < nelem(lights); i++)
+    {
+        lights[i].state = 0;
+    }
+    for(i = 0; i < nelem(iolights); i++)
+    {
+        iolights[i].state = 0;
+    }
+    setTitle();
+}
+
+// Network mode: looks netHost up into netAddr, IPv4 only: pdp1 listens on IPv4, and a name with an
+// IPv6 address too, localhost for example, could otherwise give one that never answers.
+// The lookup can take seconds when the name server or mDNS does not answer, so it is done before the
+// window opens and again only after a connect fails, at most every NETRESOLVE_MS.
+// Returns 1 when netAddr is set.
+static int
+netResolve(void)
+{
+struct addrinfo hints, *resP;
+char portStr[16];
+
+    netResolveTime = SDL_GetTicks();
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(portStr, sizeof(portStr), "%d", netPort);
+    if( getaddrinfo(netHost, portStr, &hints, &resP) != 0 )
+    {
+        return(0);
+    }
+    memcpy(&netAddr, resP->ai_addr, sizeof(netAddr));
+    freeaddrinfo(resP);
+    netResolved = 1;
+    return(1);
+}
+
+// Network mode: a connect failed or the connection went quiet; closes it and, at most every
+// NETRESOLVE_MS, has the next try look the name up again, its address may have changed.
+static void
+netFail(void)
+{
+    if( (SDL_GetTicks() - netResolveTime) >= NETRESOLVE_MS )
+    {
+        netResolved = 0;
+    }
+    netClose();
+}
+
+// Network mode: starts a connection without waiting for it, so the window stays live
+// while the host does not answer. netPoll() sees it finish, or gives up after NETTIMEOUT_MS.
+static void
+netDial(void)
+{
+int fd, one;
+
+    netLastTry = SDL_GetTicks();
+    if( !netResolved )
+    {
+        // A name not found is looked up again only after NETRESOLVE_MS, each try can block.
+        if( (SDL_GetTicks() - netResolveTime) < NETRESOLVE_MS )
+        {
+            return;
+        }
+        if( !netResolve() )
+        {
+            return;
+        }
+    }
+
+    if( (fd = socket(AF_INET, SOCK_STREAM, 0)) < 0 )
+    {
+        return;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    if( (connect(fd, (struct sockaddr *)&netAddr, sizeof(netAddr)) == 0) || (errno == EINPROGRESS) )
+    {
+        netFd = fd;
+        netConnecting = 1;
+        netConnectStart = SDL_GetTicks();
+        return;
+    }
+    close(fd);
+    netFail();
+}
+
+// Network mode: takes one P line from pdp1, see pdp1/panelsrv.c.
+static void
+netLine(char *lineP)
+{
+int present, mirror, n, i, hi, lo;
+unsigned long ack;
+unsigned sw[4];
+char *hexP;
+const char *digits = "0123456789abcdef";
+const char *hP, *lP;
+
+    if( sscanf(lineP, "P %d %d %lu %o %o %o %o %n", &present, &mirror, &ack,
+               &sw[0], &sw[1], &sw[2], &sw[3], &n) != 7 )
+    {
+        return;
+    }
+    hexP = lineP + n;
+    if( strlen(hexP) < (2 * sizeof(netLamps)) )
+    {
+        return;
+    }
+    for(i = 0; i < (int)sizeof(netLamps); i++)
+    {
+        hP = strchr(digits, hexP[2 * i]);
+        lP = strchr(digits, hexP[(2 * i) + 1]);
+        hi = (hP && *hP) ? (int)(hP - digits) : 0;
+        lo = (lP && *lP) ? (int)(lP - digits) : 0;
+        netLamps[i] = (u8)((hi << 4) | lo);
+    }
+
+    // The switch words are taken only once pdp1 has answered the last request this sent:
+    // before that they are older than what is on the screen, and taking them would undo a click.
+    if( ack >= netSeq )
+    {
+        netPanel.sw0 = sw[0];
+        netPanel.sw1 = sw[1];
+        netPanel.sw2 = sw[2];
+        netPanel.sw3 = sw[3];
+    }
+    netPresent = present;
+    netMirror = mirror;
+    netLastLine = SDL_GetTicks();
+
+    // The first line after connecting: start with the switches where pdp1 has them, keys neutral,
+    // as initpanel() does with the segment.
+    if( !netHave )
+    {
+        netHave = 1;
+        haveWritten = 0;
+        mirrorSwitches(0);
+        checkMode();
+        setTitle();
+    }
+}
+
+// Network mode, called every pass of the main loop: connects, and reads what pdp1 sent.
+void
+netPoll(void)
+{
+struct pollfd pfd;
+int err;
+socklen_t len;
+ssize_t n;
+char *startP, *nlP;
+int oldPresent;
+
+    if( netFd < 0 )
+    {
+        if( (SDL_GetTicks() - netLastTry) >= NETRETRY_MS )
+        {
+            netDial();
+        }
+        return;
+    }
+
+    if( netConnecting )
+    {
+        pfd.fd = netFd;
+        pfd.events = POLLOUT;
+        if( poll(&pfd, 1, 0) <= 0 )
+        {
+            // Not yet. A host that is off never answers, the kernel would try for minutes.
+            if( (SDL_GetTicks() - netConnectStart) >= NETTIMEOUT_MS )
+            {
+                netFail();
+            }
+            return;
+        }
+        err = 0;
+        len = sizeof(err);
+        getsockopt(netFd, SOL_SOCKET, SO_ERROR, &err, &len);
+        if( err )
+        {
+            netFail();
+            return;
+        }
+        netConnecting = 0;
+        netSeq = 0;
+        netLastLine = SDL_GetTicks();
+    }
+
+    oldPresent = netPresent;
+    for(;;)
+    {
+        n = recv(netFd, netIn + netInLen, sizeof(netIn) - 1 - netInLen, 0);
+        if( n == 0 || ((n < 0) && (errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR)) )
+        {
+            netClose();
+            return;
+        }
+        if( n < 0 )
+        {
+            break;
+        }
+        netInLen += n;
+        netIn[netInLen] = '\0';
+
+        startP = netIn;
+        while( (nlP = strchr(startP, '\n')) )
+        {
+            *nlP = '\0';
+            netLine(startP);
+            startP = nlP + 1;
+        }
+        netInLen -= (startP - netIn);
+        memmove(netIn, startP, netInLen);
+        if( netInLen >= (sizeof(netIn) - 1) )
+        {
+            netInLen = 0;   // no newline in all of that, not a line from pdp1
+        }
+    }
+
+    // pdp1 sends a line at least once a second. None for NETTIMEOUT_MS: the Pi is off or the network
+    // has gone, without a close the kernel would report only after many minutes.
+    if( (SDL_GetTicks() - netLastLine) >= NETTIMEOUT_MS )
+    {
+        netFail();
+        return;
+    }
+
+    // The hardware panel's driver started or stopped on that computer.
+    if( netHave && (netMirror != mirroring) )
+    {
+        checkMode();
+    }
+    else if( netPresent != oldPresent )
+    {
+        setTitle();
+    }
+}
+
+// Network mode: asks pdp1 to change the switch words from what this showed, netPanel's, to want.
+// Returns 1 when sent.
+static int
+netSend(const int want[3])
+{
+char line[128];
+int len;
+
+    netSeq++;
+    len = snprintf(line, sizeof(line), "S %lu %o %o %o %o %o %o\n", netSeq, (unsigned)want[0],
+                   (unsigned)want[1], (unsigned)want[2], (unsigned)netPanel.sw0,
+                   (unsigned)netPanel.sw1, (unsigned)netPanel.sw2);
+    if( send(netFd, line, len, 0) != len )     // SIGPIPE is ignored, see main()
+    {
+        netFail();
+        return(0);
+    }
+    return(1);
 }
 
 // Set the on-screen switches, and with withKeys the keys, from the switch words in the segment,
@@ -829,6 +1128,62 @@ u16 now;
 	return(word);
 }
 
+// Fans the lamp words, one per Panel lights row, out into the lamp Elements.
+// Rows 7-9, the I/O panel, only with withIo.
+//
+// Each row is read into a word exactly once, then reused for
+// every setnlights() call that reads that row (row 5 feeds both
+// ff_l and misc_l; row 6 feeds ir_l, ss_l, and pf_l) --
+// computeLightWord() moves lastcount[][] on as it reads, so
+// calling it twice for the same row would see a zero
+// difference the second time.
+static void
+setLampWords(const int w[10], int withIo)
+{
+unsigned i;
+
+    setnlights(w[0], pc_l, 16, 0100000);
+    setnlights(w[1], ma_l, 16, 0100000);
+    setnlights(w[2], mb_l, 18, 0400000);
+    setnlights(w[3], ac_l, 18, 0400000);
+    setnlights(w[4], io_l, 18, 0400000);
+    setnlights(w[5], ff_l, 13, L5_RUN);
+    setnlights(w[5], misc_l, 3, L5_PWR);
+    setnlights(w[6], ir_l, 5, 0400000);
+    setnlights(w[6], ss_l, 6, 0004000);
+    setnlights(w[6], pf_l, 6, 0000040);
+
+    if( withIo )
+    {
+        for(i = 0; i < nelem(iolights); i++)
+        {
+            iolights[i].state = !!(w[iolamps[i].row] & iolamps[i].mask);
+        }
+    }
+}
+
+// Network mode: the lamp words from pdp1's brightness, on at PWM_ON_THRESHOLD or more as with the
+// segment: pdp1 rounds, so half is 128. pdp1 sends them dark with POWER off and has already stretched H.S. CYCLE.
+static void
+netLamps2Words(void)
+{
+int w[10];
+int r, c;
+
+    for(r = 0; r < 10; r++)
+    {
+        w[r] = 0;
+        for(c = 0; c < 18; c++)
+        {
+            if( netPresent && (netLamps[(r * 18) + c] >= (u8)((PWM_ON_THRESHOLD * 255.0f) + 0.5f)) )
+            {
+                w[r] |= 1 << c;
+            }
+        }
+    }
+    setLampWords(w, showIo);
+}
+
 // Called once per main-loop iteration after mouse() has updated every
 // switch/key Element's `state` from the current input and before draw().
 // Two jobs: (1) collapse the on-screen switch/key state into panel->sw0-2
@@ -847,9 +1202,15 @@ u16 now;
 void
 updatepanel(void)
 {
-	int sw;
-	int w0, w1, w2, w3, w4, w5, w6;
+	int sw, r;
+	int w[10];
 	u64 currentcyclecount, expectedcycles;
+
+    // Network mode with no connection: nothing to read, and nowhere to write.
+    if( netHost && !netHave )
+    {
+        return;
+    }
 
     // Someone else changed the switch words since this wrote them, take theirs and look for the driver now.
     // If it is there, checkMode() starts mirroring and nothing is written below.
@@ -895,12 +1256,38 @@ updatepanel(void)
 
         lastSw[3] = 0;	// no spacewar controllers for now
 
-        // Recorded from what is written, not read back: a read back could pick up another writer's value.
-        panel->sw0 = lastSw[0];
-        panel->sw1 = lastSw[1];
-        panel->sw2 = lastSw[2];
-        panel->sw3 = lastSw[3];
-        haveWritten = 1;
+        if( netHost )
+        {
+            // Network mode: only a change is sent, it changes the bits that differ from netPanel's,
+            // what pdp1 last sent; netPanel then shows the change until pdp1 has answered it.
+            if( (lastSw[0] != panel->sw0) || (lastSw[1] != panel->sw1) || (lastSw[2] != panel->sw2) )
+            {
+                if( !netSend(lastSw) )
+                {
+                    return;
+                }
+                panel->sw0 = lastSw[0];
+                panel->sw1 = lastSw[1];
+                panel->sw2 = lastSw[2];
+            }
+            lastSw[3] = panel->sw3;     // not this program's, see mirrorSwitches()
+            haveWritten = 1;
+        }
+        else
+        {
+            // Recorded from what is written, not read back: a read back could pick up another writer's value.
+            panel->sw0 = lastSw[0];
+            panel->sw1 = lastSw[1];
+            panel->sw2 = lastSw[2];
+            panel->sw3 = lastSw[3];
+            haveWritten = 1;
+        }
+    }
+
+    if( netHost )
+    {
+        netLamps2Words();
+        return;
     }
 
     // With the power off, pdp1 stops advancing cyclecount, the lights need to be forced off.
@@ -939,47 +1326,14 @@ updatepanel(void)
             return;
         }
 
-        // Each row is read into a word exactly once, then reused for
-        // every setnlights() call that reads that row (row 5 feeds both
-        // ff_l and misc_l; row 6 feeds ir_l, ss_l, and pf_l) --
-        // computeLightWord() moves lastcount[][] on as it reads, so
-        // calling it twice for the same row would see a zero
-        // difference the second time.
-		w0 = computeLightWord(panel, 0, expectedcycles);
-		w1 = computeLightWord(panel, 1, expectedcycles);
-		w2 = computeLightWord(panel, 2, expectedcycles);
-		w3 = computeLightWord(panel, 3, expectedcycles);
-		w4 = computeLightWord(panel, 4, expectedcycles);
-		w5 = computeLightWord(panel, 5, expectedcycles);
-		w6 = computeLightWord(panel, 6, expectedcycles);
-
-		setnlights(w0, pc_l, 16, 0100000);
-		setnlights(w1, ma_l, 16, 0100000);
-		setnlights(w2, mb_l, 18, 0400000);
-		setnlights(w3, ac_l, 18, 0400000);
-		setnlights(w4, io_l, 18, 0400000);
-		setnlights(w5, ff_l, 13, L5_RUN);
-		setnlights(w5, misc_l, 3, L5_PWR);
-		setnlights(w6, ir_l, 5, 0400000);
-		setnlights(w6, ss_l, 6, 0004000);
-		setnlights(w6, pf_l, 6, 0000040);
-
+        // Each row is read exactly once, see setLampWords().
         // Rows 7-9, the I/O panel, only when it is shown.
         // Otherwise they are not read, lastcount[][] for them is never used.
-        if( showIo )
+        for(r = 0; r < (showIo ? 10 : 7); r++)
         {
-            int iow[3];
-            unsigned i;
-
-            iow[0] = computeLightWord(panel, 7, expectedcycles);
-            iow[1] = computeLightWord(panel, 8, expectedcycles);
-            iow[2] = computeLightWord(panel, 9, expectedcycles);
-
-            for(i = 0; i < nelem(iolights); i++)
-            {
-                iolights[i].state = !!(iow[iolamps[i].row - 7] & iolamps[i].mask);
-            }
+            w[r] = computeLightWord(panel, r, expectedcycles);
         }
+        setLampWords(w, showIo);
 	}
 }
 
@@ -1011,10 +1365,11 @@ ConfigurationSettingP settingP;
 void
 usage(void)
 {
-    printf("Usage: vpanel_pdp1 [-s scale] [-i] [-n]\n");
+    printf("Usage: vpanel_pdp1 [-s scale] [-i] [-n] [-h host[:port]]\n");
     printf("-s scale, window size multiplier, %.1f to %.1f, for example 1.5\n", MIN_SCALE, MAX_SCALE);
     printf("-i, show the rack top (I/O) panel\n");
     printf("-n, don't show the rack top (I/O) panel\n");
+    printf("-h host[:port], the panel of the pdp1 on host, IPv4, through its panel port, default %d\n", NETPORT);
     printf("While the hardware panel's driver runs, the switches mirror the hardware panel's.\n");
     exit(1);
 }
@@ -1037,7 +1392,7 @@ main(int argc, char *argv[])
 
     loadConfig();           // command line switches override the config file
 
-    while( (opt = getopt(argc, argv, "s:in")) != -1 )
+    while( (opt = getopt(argc, argv, "s:inh:")) != -1 )
     {
         switch( opt )
         {
@@ -1053,6 +1408,10 @@ main(int argc, char *argv[])
             showIo = 0;
             break;
 
+        case 'h':
+            netHost = strdup(optarg);
+            break;
+
         default:
             usage();
             break;
@@ -1062,6 +1421,32 @@ main(int argc, char *argv[])
     if( optind < argc )
     {
         usage();
+    }
+
+    // host:port, IPv4 only, as pdp1 listens.
+    if( netHost )
+    {
+        char *colonP = strchr(netHost, ':');
+
+        if( colonP )
+        {
+            *colonP = '\0';
+            netPort = atoi(colonP + 1);
+        }
+        if( (netPort <= 0) || (netPort > 65535) || !netHost[0] )
+        {
+            usage();
+        }
+
+        // A send() to a connection pdp1 has closed would end the program, as on any system.
+        signal(SIGPIPE, SIG_IGN);
+
+        // Looked up now, before the window opens, see netResolve(). Not found: tried again later.
+        if( !netResolve() )
+        {
+            fprintf(stderr, "vpanel_pdp1: can't find %s now, trying again every %d s\n", netHost,
+                    NETRESOLVE_MS / 1000);
+        }
     }
 
     if( !(scale >= MIN_SCALE) )     // also catches nan
@@ -1091,6 +1476,7 @@ main(int argc, char *argv[])
 
 	initpanel();
     checkMode();
+    setTitle();
 
 	for(;;)
     {
@@ -1129,12 +1515,16 @@ main(int argc, char *argv[])
         // pwmcount[][], and a skipped read would put the skipped time into the
         // next window's duty.
         // Look for the hardware panel's driver now and then, it can start or stop at any time.
-        if( (SDL_GetTicks() - lastCheck) >= HWCHECK_MS )
+        if( !netHost && ((SDL_GetTicks() - lastCheck) >= HWCHECK_MS) )
         {
             checkMode();
             lastCheck = SDL_GetTicks();
         }
 
+        if( netHost )
+        {
+            netPoll();
+        }
 		updatepanel();
 
         // An unchanged frame is not drawn: when exposed, every presented frame

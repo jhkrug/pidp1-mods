@@ -6,6 +6,7 @@
 //    connections their own threads, dial() times out, the segment fds are closed after mmap()
 // 06-Oct-2026 Claude dialQuietly(), dial() without its report, for a caller that retries
 // 07-Nov-2026 Claude split() frees its word block when the line is empty
+// 17-Nov-2026 Claude hwPanelRunning(), moved here from vpanel_pdp1 for pdp1's panel port too
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -17,6 +18,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -679,4 +681,62 @@ char **argv, *lp, *words, delim;
     argv[argc++] = nil;
 
     return( argv );
+}
+
+// The hardware panel driver's process names: newpanel, run through the bin/panel_pidp1 link
+// as the scripts do or directly.
+static const char *hwPanelNames[] = { "panel_pidp1", "newpanel" };
+
+// Returns 1 if the hardware panel's driver is running, else 0.
+// Processes are matched by their exact name in /proc/<pid>/comm, as pdp1central's procCount() does,
+// a pattern could match something else.
+// A running driver shows that frontpanel=pidp is set. It does not show that a PiDP-1 board is
+// connected: the driver uses the GPIO controller of the Pi, which every Pi has.
+int
+hwPanelRunning(void)
+{
+DIR *dirP;
+struct dirent *entP;
+FILE *fP;
+char path[sizeof(entP->d_name) + 16];
+char comm[64];
+unsigned i;
+int found;
+
+    if( !(dirP = opendir("/proc")) )
+    {
+        return(0);
+    }
+
+    found = 0;
+    while( !found && (entP = readdir(dirP)) )
+    {
+        if( (entP->d_name[0] < '0') || (entP->d_name[0] > '9') )
+        {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "/proc/%s/comm", entP->d_name);
+        if( !(fP = fopen(path, "r")) )
+        {
+            continue;           // it ended while we looked
+        }
+
+        if( fgets(comm, sizeof(comm), fP) )
+        {
+            comm[strcspn(comm, "\n")] = '\0';
+            for(i = 0; i < nelem(hwPanelNames); i++)
+            {
+                if( !strcmp(comm, hwPanelNames[i]) )
+                {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        fclose(fP);
+    }
+
+    closedir(dirP);
+    return(found);
 }

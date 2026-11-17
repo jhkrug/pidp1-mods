@@ -1,10 +1,11 @@
 // The emulator's network ports: the command port (1040), the paper tape reader and punch (1042,
-// 1043) and the four display screens (3400-3403).
+// 1043), the front panel (1046, panelsrv.c) and the four display screens (3400-3403).
 // The typewriter's port, 1041, is typtelnet.c's.
 // netthread() listens on them for the life of the process and runs the fd hand-overs on its own
 // thread; serveN() (pollfd.c) gives the command port's handler a thread per connection.
 //
 // 8-Nov-2026 wje - start history, original code never had it, fix an issue with nonterminated lines.
+// 17-Nov-2026 Claude - the front panel's port, 1046
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +18,7 @@
 #include "display.h"
 #include "papertape.h"
 #include "netPorts.h"
+#include "panelsrv.h"
 
 // How long a command with no newline waits for more bytes before it runs as it stands.
 // pdp1audio sends its command with no newline and waits for the reply on the open connection.
@@ -214,6 +216,8 @@ netthread(void *arg)
         // 1041 is typewriter
         { 1042, handleptr, 0 },
         { 1043, handleptp, 0 },
+        // 1044 and 1045 are the AD1 debugger's, ad1server.c
+        { PANELPORT, handlepanelnet, 1 },
         { 3400, handledpy, 0 },
         { 3401, handledpy2, 0 },
         { 3402, handledpy3, 0 },

@@ -3,6 +3,7 @@
 
 // 8-Apr-2026 wje initial cleanup
 // 05-Oct-2026 Claude PortHandler.threaded; pollfd.c's markFdReady() and typtelnetInput() replace startpolling()
+// 17-Nov-2026 Claude hwPanelRunning()
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,8 @@ void nodelay(int fd);
 
 void *createseg(const char *name, size_t sz);
 void *attachseg(const char *name, size_t sz);
+
+int hwPanelRunning(void);
 
 void inittime(void);
 u64 gettime(void);

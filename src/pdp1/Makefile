@@ -20,7 +20,7 @@ endif
 # Nothing else needs to change.
 LOCAL_SRCS = main.c panel1.c typtelnet.c audio.c lowpass.c pdp1.c dynamicIots.c \
     highSpeedChannels.c configuration.c display.c lpPredictor.c ad1server.c console.c papertape.c \
-    netPorts.c coreImage.c timingReport.c
+    netPorts.c coreImage.c timingReport.c panelsrv.c
 PARENT_SRCS = ../common/common.c ../common/pollfd.c ../common/logger.c
 
 OBJS = $(LOCAL_SRCS:.c=.o) $(notdir $(PARENT_SRCS:.c=.o))

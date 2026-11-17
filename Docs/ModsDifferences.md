@@ -87,6 +87,7 @@ Some of these have been mentioned above.
 - all of the demo programs that use IOTs not in the original branch
 These also use am1.
 - on-screen panel vpanel_pdp1 with the rack top (I/O) panel, window scaling and hardware panel mirroring; a front panel in the web interface.
+- the emulator's front panel port, 1046, so vpanel_pdp1 can run on another computer.
 
 ## Additions that are independent of any branch
 
